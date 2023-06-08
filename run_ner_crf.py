@@ -11,13 +11,13 @@ from torch.utils.data.distributed import DistributedSampler
 from callback.optimizater.adamw import AdamW
 from callback.lr_scheduler import get_linear_schedule_with_warmup
 from callback.progressbar import ProgressBar
-from tools.common import seed_everything,json_to_text
+from tools.common import seed_everything, json_to_text
 from tools.common import init_logger, logger
 
-from transformers import WEIGHTS_NAME, BertConfig,get_linear_schedule_with_warmup,AdamW, BertTokenizer
+from transformers import WEIGHTS_NAME, BertConfig, get_linear_schedule_with_warmup, AdamW, BertTokenizer
 from models.bert_for_ner import BertCrfForNer
 from processors.utils_ner import get_entities
-from processors.ner_seq import convert_examples_to_features
+from processors.ner_seq import convert_examples_to_features, InputExample
 from processors.ner_seq import ner_processors as processors
 from processors.ner_seq import collate_fn
 from metrics.ner_metrics import SeqEntityScore
@@ -27,6 +27,7 @@ MODEL_CLASSES = {
     ## bert ernie bert_wwm bert_wwwm_ext
     'bert': (BertConfig, BertCrfForNer, BertTokenizer),
 }
+
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
@@ -114,8 +115,8 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     seed_everything(args.seed)  # Added here for reproductibility (even between python 2 and 3)
     pbar = ProgressBar(n_total=len(train_dataloader), desc='Training', num_epochs=int(args.num_train_epochs))
-    if args.save_steps==-1 and args.logging_steps==-1:
-        args.logging_steps=len(train_dataloader)
+    if args.save_steps == -1 and args.logging_steps == -1:
+        args.logging_steps = len(train_dataloader)
         args.save_steps = len(train_dataloader)
     for epoch in range(int(args.num_train_epochs)):
         pbar.reset()
@@ -200,6 +201,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     pbar = ProgressBar(n_total=len(eval_dataloader), desc="Evaluating")
     if isinstance(model, nn.DataParallel):
         model = model.module
+
     for step, batch in enumerate(eval_dataloader):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
@@ -276,7 +278,7 @@ def predict(args, model, tokenizer, prefix=""):
             outputs = model(**inputs)
             logits = outputs[0]
             tags = model.crf.decode(logits, inputs['attention_mask'])
-            tags  = tags.squeeze(0).cpu().numpy().tolist()
+            tags = tags.squeeze(0).cpu().numpy().tolist()
         preds = tags[0][1:-1]  # [CLS]XXXX[SEP]
         label_entities = get_entities(preds, args.id2label, args.markup)
         json_d = {}
@@ -286,13 +288,13 @@ def predict(args, model, tokenizer, prefix=""):
         results.append(json_d)
         pbar(step)
     logger.info("\n")
-    with open(output_predict_file, "w") as writer:
+    with open(output_predict_file, "w", encoding="utf-8") as writer:
         for record in results:
             writer.write(json.dumps(record) + '\n')
     if args.task_name == 'cluener':
         output_submit_file = os.path.join(pred_output_dir, prefix, "test_submit.json")
         test_text = []
-        with open(os.path.join(args.data_dir,"test.json"), 'r') as fr:
+        with open(os.path.join(args.data_dir, "test.json"), 'r') as fr:
             for line in fr:
                 test_text.append(json.loads(line))
         test_submit = []
@@ -317,18 +319,46 @@ def predict(args, model, tokenizer, prefix=""):
                         json_d['label'][tag] = {}
                         json_d['label'][tag][word] = [[start, end]]
             test_submit.append(json_d)
-        json_to_text(output_submit_file,test_submit)
+        json_to_text(output_submit_file, test_submit)
+
+
+def seperate(examples, max_seq_length):
+    result = []
+    for example in examples:
+        start = 0
+        end = max_seq_length - 2
+        i = 0
+        if len(example.text_a) > max_seq_length - 2:
+            while len(example.text_a) - start > max_seq_length - 2:
+                j = end
+                while j >= start:
+                    if example.text_a[j] in "；，。、！;,./!:??":
+                        j += 1
+                        break
+                    j -= 1
+                if j < start:
+                    j = end
+                result.append(InputExample(example.guid + "_" + str(i), text_a=example.text_a[start:j],
+                                           labels=example.labels[start:j]))
+                start = j
+                end = start + max_seq_length - 2
+                i += 1
+            result.append(
+                InputExample(example.guid + "_" + str(i), text_a=example.text_a[start:], labels=example.labels[start:]))
+        else:
+            result.append(example)
+    return result
+
 
 def load_and_cache_examples(args, task, tokenizer, data_type='train'):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
     processor = processors[task]()
     # Load data features from cache or dataset file
+    max_seq_length = args.train_max_seq_length if data_type == 'train' else args.eval_max_seq_length
     cached_features_file = os.path.join(args.data_dir, 'cached_crf-{}_{}_{}_{}'.format(
         data_type,
-        list(filter(None, args.model_name_or_path.split('/'))).pop(),
-        str(args.train_max_seq_length if data_type == 'train' else args.eval_max_seq_length),
-        str(task)))
+        list(filter(None, args.model_name_or_path.split('/'))).pop(), str(max_seq_length), str(task)))
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
@@ -341,11 +371,11 @@ def load_and_cache_examples(args, task, tokenizer, data_type='train'):
             examples = processor.get_dev_examples(args.data_dir)
         else:
             examples = processor.get_test_examples(args.data_dir)
+        examples = seperate(examples, max_seq_length)
         features = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
                                                 label_list=label_list,
-                                                max_seq_length=args.train_max_seq_length if data_type == 'train' \
-                                                    else args.eval_max_seq_length,
+                                                max_seq_length=max_seq_length,
                                                 cls_token_at_end=bool(args.model_type in ["xlnet"]),
                                                 pad_on_left=bool(args.model_type in ['xlnet']),
                                                 cls_token=tokenizer.cls_token,
@@ -372,13 +402,11 @@ def load_and_cache_examples(args, task, tokenizer, data_type='train'):
 
 def main():
     args = get_argparse().parse_args()
-
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
-    args.output_dir = args.output_dir + '{}'.format(args.model_type)
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
-    time_ = time.strftime("%Y-%m-%d-%H:%M:%S", time.localtime())
+    time_ = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     init_logger(log_file=args.output_dir + f'/{args.model_type}-{args.task_name}-{time_}.log')
     if os.path.exists(args.output_dir) and os.listdir(
             args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -399,7 +427,10 @@ def main():
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend="nccl")
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '5678'
+        torch.distributed.init_process_group(backend='nccl', init_method='env://', rank=0, world_size=1)
+        # torch.distributed.init_process_group(backend="nccl")
         args.n_gpu = 1
     args.device = device
     logger.warning(
@@ -422,9 +453,9 @@ def main():
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.model_name_or_path,num_labels=num_labels,)
+    config = config_class.from_pretrained(args.model_name_or_path, num_labels=num_labels, )
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path,
-                                                do_lower_case=args.do_lower_case,)
+                                                do_lower_case=args.do_lower_case, )
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -451,6 +482,7 @@ def main():
         tokenizer.save_vocabulary(args.output_dir)
         # Good practice: save your training arguments together with the trained model
         torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
+
     # Evaluation
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
@@ -461,6 +493,7 @@ def main():
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + "/**/" + WEIGHTS_NAME, recursive=True))
             )
             logging.getLogger("pytorch_transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         for checkpoint in checkpoints:
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
@@ -490,6 +523,22 @@ def main():
             model = model_class.from_pretrained(checkpoint, config=config)
             model.to(args.device)
             predict(args, model, tokenizer, prefix=prefix)
+            if os.path.exists(os.path.join(args.output_dir, prefix, "test_prediction.json")):
+                # 转text处理
+                f_raw = open(os.path.join(args.data_dir, "test.char.bmes"), encoding="utf-8")
+                f_json = open(os.path.join(args.output_dir, prefix, "test_prediction.json"), encoding="utf-8")
+                fw = open(os.path.join(args.output_dir, prefix, "test_prediction.txt"), mode="w", encoding="utf-8")
+                for line in f_json.readlines():
+                    entity = json.loads(line)
+                    for tag in entity["tag_seq"].split(" "):
+                        next = f_raw.readline().strip()
+                        while len(next) == 0:
+                            fw.write(next + "\n")
+                            next = f_raw.readline().strip()
+                        fw.write(next + "\t" + tag + "\n")
+                f_raw.close()
+                f_json.close()
+                fw.close()
 
 
 if __name__ == "__main__":

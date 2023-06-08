@@ -2,7 +2,7 @@ CURRENT_DIR=`pwd`
 export BERT_BASE_DIR=$CURRENT_DIR/prev_trained_model/bert-base-chinese
 export DATA_DIR=$CURRENT_DIR/datasets
 export OUTPUR_DIR=$CURRENT_DIR/outputs
-TASK_NAME="cner"
+TASK_NAME="msra"
 #
 python run_ner_crf.py \
   --model_type=bert \
@@ -10,6 +10,7 @@ python run_ner_crf.py \
   --task_name=$TASK_NAME \
   --do_train \
   --do_eval \
+  --do_predict \
   --do_lower_case \
   --data_dir=$DATA_DIR/${TASK_NAME}/ \
   --train_max_seq_length=128 \
@@ -20,7 +21,8 @@ python run_ner_crf.py \
   --crf_learning_rate=1e-3 \
   --num_train_epochs=4.0 \
   --logging_steps=-1 \
-  --save_steps=-1 \
+  --save_steps=2000 \
   --output_dir=$OUTPUR_DIR/${TASK_NAME}_output/ \
   --overwrite_output_dir \
-  --seed=42
+  --seed=42 \
+  --eval_all_checkpoints
